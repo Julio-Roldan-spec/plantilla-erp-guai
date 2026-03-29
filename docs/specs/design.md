@@ -77,7 +77,7 @@ Plantilla
 
 | Entidad ERP | Cambio |
 |-------------|--------|
-| **Expediente** | Nuevo campo `tipo_recurso_asignado` (PLANTILLA / AUTONOMO / MIXTO) |
+| **Expediente** | Cada servicio tiene `tipo_recurso` (PLANTILLA / AUTONOMO). El expediente puede tener servicios de ambos tipos. |
 | **Servicio** (dentro de expediente) | Nuevo campo `empleado_id` (alternativo a `operario_id`) |
 | **Factura a compania** | Campo `coste_interno` para calcular margen real |
 | **Baremo de operario** | Nuevo baremo de tipo "plantilla" = coste/hora interno |
@@ -207,15 +207,24 @@ Aplica reglas R-PLA-01 a R-PLA-08 como filtros eliminatorios:
 
 ### 5.3 FASE 2 — Calculo de coste comparado
 
+**Fuente de estimaciones:**
+- `horas_estimadas`: Media historica por gremio + tipo de servicio + zona de los ultimos 6 meses. Fallback: valor configurable por gremio en Configuracion.
+- `materiales_estimados`: Media historica por gremio + tipo de servicio. Fallback: 0 (se ignora si no hay datos).
+- `baremo_operario`: Precio que CuidaCasa paga al autonomo (tabla baremos de operario existente).
+- `baremo_compania`: Precio que la aseguradora paga a CuidaCasa (tabla baremos de compania existente).
+- Para empleados nuevos sin snapshot mensual de coste: se usa coste/hora provisional = (salario_bruto_anual / 12 * 1.33) / horas_semanales / 4.33.
+
 ```
 Coste_plantilla = horas_estimadas x coste_hora_empleado + materiales_estimados + desplazamiento_km
-Coste_autonomo  = baremo_compania x unidades_estimadas (lo que pagariamos al autonomo)
-Ingreso_cia     = baremo_compania x unidades_estimadas (lo que cobra la aseguradora)
+Coste_autonomo  = baremo_operario x unidades_estimadas (lo que CuidaCasa paga al autonomo)
+Ingreso_cia     = baremo_compania x unidades_estimadas (lo que la aseguradora paga a CuidaCasa)
 
 Margen_plantilla = Ingreso_cia - Coste_plantilla
 Margen_autonomo  = Ingreso_cia - Coste_autonomo
 Delta_margen     = Margen_plantilla - Margen_autonomo
 ```
+
+**Nota:** `baremo_operario` y `baremo_compania` son baremos distintos que ya existen en el ERP. El margen del negocio con autonomos es precisamente Ingreso_cia - Coste_autonomo. El Orquestador compara si usando plantilla ese margen mejora o empeora.
 
 ### 5.4 FASE 3 — Reglas de decision (configurables por delegacion)
 
@@ -226,7 +235,7 @@ Delta_margen     = Margen_plantilla - Margen_autonomo
 | RO-03 | `Delta_margen < umbral_negativo` | **Red guAI** (autonomo mas barato) |
 | RO-04 | Urgencia fuera de horario laboral | **Red guAI** (autonomo con guardia) |
 | RO-05 | Empleado disponible pero a >45 min del siniestro | Evaluar: si autonomo a <20 min -> **Red guAI** |
-| RO-06 | Servicio requiere cuadrilla pero solo hay 1 empleado | **Red guAI** o **Mixto** |
+| RO-06 | Servicio requiere cuadrilla pero cuadrilla incompleta | **Red guAI** (R-PLA-10: cuadrilla se asigna completa o no se asigna) |
 | RO-07 | Ocupacion plantilla zona > 90% | **Red guAI** + alerta de saturacion |
 | RO-08 | Ocupacion plantilla zona < 40% | Forzar **Plantilla** (evitar infrautilizacion) |
 
@@ -347,6 +356,26 @@ Empleado llega al domicilio
   -> Coste interno se calcula y alimenta al Dashboard
 ```
 
+**Maquina de estados del ParteTrabajo:**
+
+```
+                    +-> materiales_pendientes --+
+                    |                           |
+en_curso --> parcial +--> requiere_revisita ----+--> completado
+   |                                            |
+   +--------------------------------------------+
+```
+
+| Transicion | Desde | Hasta | Condicion |
+|-----------|-------|-------|-----------|
+| Iniciar | (nuevo) | en_curso | Hora inicio registrada |
+| Pausar | en_curso | parcial | Hora fin registrada sin completar |
+| Faltan materiales | en_curso / parcial | materiales_pendientes | Operario marca materiales pendientes |
+| Requiere revisita | en_curso / parcial | requiere_revisita | Trabajo no completable en esta visita |
+| Completar | en_curso / parcial / materiales_pendientes / requiere_revisita | completado | Trabajo terminado + firma asegurado |
+
+**Nota:** `completado` es estado terminal. No se puede reabrir un parte; si hay rework se crea parte nuevo vinculado al mismo servicio.
+
 ### 7.2 Control de Jornada (fichajes)
 
 Cumplimiento del RD 8/2019:
@@ -455,6 +484,7 @@ empleados_plantilla (
     fecha_alta_empresa  DATE NOT NULL,
     activo              BOOLEAN DEFAULT true,
     foto_url            VARCHAR(500),
+    coste_hora_actual   DECIMAL(8,2),  -- recalculado al cambiar contrato/equipamiento, usado por Orquestador en tiempo real
     created_at          TIMESTAMP DEFAULT NOW(),
     updated_at          TIMESTAMP DEFAULT NOW()
 )
@@ -491,11 +521,12 @@ empleado_zonas (
     UNIQUE(empleado_id, zona_id)
 )
 
--- Fichajes diarios
+-- Fichajes (multiples por dia: turno partido, correciones, pausas)
 fichajes (
     id                  UUID PK,
     empleado_id         UUID FK empleados_plantilla,
     fecha               DATE NOT NULL,
+    secuencia           INTEGER NOT NULL DEFAULT 1,  -- 1=primer fichaje del dia, 2=segundo (turno partido), etc.
     hora_entrada        TIME NOT NULL,
     hora_salida         TIME,
     horas_totales       DECIMAL(4,2),
@@ -503,7 +534,7 @@ fichajes (
     metodo_fichaje      ENUM('app_movil','erp_web','tablet_delegacion'),
     ubicacion_gps       VARCHAR(50),
     created_at          TIMESTAMP DEFAULT NOW(),
-    UNIQUE(empleado_id, fecha)
+    UNIQUE(empleado_id, fecha, secuencia)  -- permite multiples fichajes/dia (turno partido)
 )
 
 -- Turnos
@@ -558,7 +589,7 @@ partes_trabajo (
     hora_fin            TIME,
     horas_efectivas     DECIMAL(4,2),
     desplazamiento_km   DECIMAL(6,1),
-    estado_trabajo      ENUM('completado','parcial','requiere_revisita','materiales_pendientes'),
+    estado_trabajo      ENUM('en_curso','parcial','materiales_pendientes','requiere_revisita','completado'),
     coste_horas         DECIMAL(10,2),
     coste_materiales    DECIMAL(10,2),
     coste_desplazamiento DECIMAL(10,2),
@@ -593,7 +624,8 @@ equipamiento_asignado (
     notas               TEXT
 )
 
--- Coste interno calculado (snapshot mensual)
+-- Coste interno calculado (snapshot mensual para reporting)
+-- El Orquestador usa coste_hora_actual de la tabla empleados_plantilla para decisiones en tiempo real
 costes_internos (
     id                  UUID PK,
     empleado_id         UUID FK empleados_plantilla,
@@ -608,6 +640,10 @@ costes_internos (
     coste_hora          DECIMAL(8,2),
     UNIQUE(empleado_id, mes)
 )
+-- Nota: empleados_plantilla tiene un campo coste_hora_actual (DECIMAL 8,2)
+-- que se recalcula al crear/modificar contrato o equipamiento.
+-- Para empleados nuevos sin snapshot: coste_hora_actual = (salario_bruto_anual/12*1.33) / (horas_semanales*4.33)
+-- El snapshot mensual se genera via job nocturno el dia 1 de cada mes.
 
 -- Decisiones del Orquestador
 decisiones_orquestador (
@@ -617,7 +653,7 @@ decisiones_orquestador (
     gremio              VARCHAR(50) NOT NULL,
     zona                VARCHAR(50) NOT NULL,
     fecha_hora          TIMESTAMP DEFAULT NOW(),
-    tipo_decision       ENUM('plantilla','autonomo','mixto'),
+    tipo_decision       ENUM('plantilla','autonomo'),  -- sin 'mixto': cada servicio es plantilla o autonomo
     regla_aplicada      VARCHAR(10),
     razon               TEXT NOT NULL,
     candidatos_plantilla JSONB,
